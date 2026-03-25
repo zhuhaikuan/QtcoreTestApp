@@ -1,0 +1,6 @@
+<resources>
+    <string translatable="false" name="author_me">me</string>
+    <string translatable="false" name="q_and_a_send">Send</string>
+    <string translatable="false" name="q_and_a_text_box_hint">Enter Message</string>
+    <string translatable="false" name="login">Login</string>
+</resources>
