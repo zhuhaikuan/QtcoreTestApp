@@ -70,7 +70,7 @@ actual object AccountManager {
         activity = context
         val application = activity.application
 
-        val deviceType = if (AndroidUtil.isDevicePRC()) MotoDeviceType.MOTO_PRC else MotoDeviceType.MOTO_ROW
+        val deviceType = if (AndroidUtil.isDevicePrc()) MotoDeviceType.MOTO_PRC else MotoDeviceType.MOTO_ROW
         logD(TAG) { "device: $deviceType" }
         val motoIdConfig = MotoIdConfig(
             BuildConfig.LENOVOID_CLIENT_ID,

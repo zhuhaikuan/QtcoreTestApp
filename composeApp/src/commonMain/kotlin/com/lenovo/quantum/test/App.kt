@@ -118,23 +118,31 @@ fun App(chatbotViewModel: ChatbotViewModel) {
 
                     "get_memory" -> {
                         if (chatbotViewModel.fkbBatchJsonArray.length() == 0)
-                            "Enter {\"entries\": [1,3,4]} or {\"query\": \"What is my name?\"}"
+                            "Enter {\"entries\": [1,3,4]} or {\"query\": \"What is my name?\"} or" +
+                                    "{\"fuzzy_search\": \"text_to_search\"}"
                         else
                             "Batch Query Mode"
                     }
 
+                    "get_all_memory" -> "Enter {\"page_number\": 1, \"page_size\": 8}"
+
                     "delete_memory" -> "Enter {\"entries\": [1,3,4]}"
+
+                    "user_tags_update" -> "Enter {\"entries\": [1,3], \"user_tags\": [\"tag\"]}"
+
+                    "user_tags_get" -> "Enter {\"user_tags\": [\"tag\"]}"
+
+                    "user_tags_delete" -> "Enter {\"user_tags\": [\"tag\"]}"
+
+                    "user_tags_create" -> "Enter {\"user_tags\": [\"tag\"], \"colors\": [\"color\"]}"
+
                     else -> null
                 }
             }
             "document" -> {
                 when(chatbotViewModel.selectedAction) {
-                    ADD_ACTION, ADD_AND_PARSE_ACTION -> "Pick a pdf document"
-                    LIST_ACTION -> if (!getPlatform().name.contains("Android")) {
-                        "Enter folder to be listed"
-                    } else {
-                        null
-                    }
+                    ADD_ACTION -> "Pick a document"
+                    LIST_ACTION -> "Enter folder to be listed or ALL to list all uploaded files"
                     DELETE_ACTION -> "Enter {\"doc_ids\": [1,2,3]}"
                     else -> null
                 }
@@ -144,6 +152,19 @@ fun App(chatbotViewModel: ChatbotViewModel) {
                     KBQA_ACTION, SUMMARY_ACTION -> "Enter {\"query\": \"User query text\", \"doc_ids\": \"[1,2,3]\"}"
                     DOCUMENT_SEARCH_ACTION -> "Enter {\"query\": \"User query text\", \"fileTypes\": \"[\"pdf\"]\"}"
                     IMAGE_SEARCH_ACTION -> "Enter {\"query\": \"User query text\", \"imageDescription\": \"Image description text\"}"
+                    else -> null
+                }
+            }
+            "session" -> {
+                when (chatbotViewModel.selectedAction) {
+                    "get" -> "Enter the sessionID to retrieve history"
+                    "update" -> "Enter the name of this session"
+                    else -> null
+                }
+            }
+            "qt_prefs" -> {
+                when (chatbotViewModel.selectedAction) {
+                    "set_qt_prefs" -> "Enter <personalized_content>;<sync_enabled>"
                     else -> null
                 }
             }
@@ -182,30 +203,22 @@ fun App(chatbotViewModel: ChatbotViewModel) {
                         onOptionSelected = { action ->
                             chatbotViewModel.setAction(action)
                             val command = chatbotViewModel.selectedCommand
-                            when (command) {
-                                "fkb_memory" -> {
-                                    if (action == "get_all_memory" || action == "delete_all_memory") {
-                                        chatbotViewModel.sendQuery(command)
-                                    }
+                            if (command == "fkb_memory") {
+                                if (action == "delete_all_memory") {
+                                    chatbotViewModel.sendQuery(command)
                                 }
-
-                                "document" -> {
-                                    when (action) {
-                                        ADD_ACTION, ADD_AND_PARSE_ACTION, PARSE_ACTION, DELETE_ACTION -> {
-                                            if (chatbotViewModel.chosenFile == null) {
-                                                showTip()
-                                            } else {
-                                                chatbotViewModel.sendQuery("")
-                                            }
-                                        }
-
-                                        LIST_ACTION -> chatbotViewModel.sendQuery("")
-                                        COLLECT_ACTION -> chatbotViewModel.sendQuery("")
-                                        STATISTIC_ACTION -> chatbotViewModel.sendQuery("")
-                                        RE_PARSE_ACTION -> chatbotViewModel.sendQuery("")
-                                        COLLECT_ALL_ACTION -> chatbotViewModel.sendQuery("")
-                                        SYNC_ACTION -> chatbotViewModel.sendQuery("")
-                                    }
+                                else if (action == "user_tags_get_available") {
+                                    chatbotViewModel.sendQuery(command)
+                                }
+                            }
+                            if (command == "document") {
+                                if (action == LIST_ACTION && getPlatform().name.contains("Android")) {
+                                    chatbotViewModel.sendQuery("")
+                                }
+                            }
+                            if (command == "qt_prefs"){
+                                if (action == "get_qt_prefs") {
+                                    chatbotViewModel.sendQuery(command)
                                 }
                             }
                         },

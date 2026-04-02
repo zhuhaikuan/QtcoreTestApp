@@ -28,6 +28,7 @@ import com.lenovo.quantum.test.client.FileAttachment
 import com.lenovo.quantum.test.client.AudioStream
 import com.lenovo.quantum.test.util.audio.saveRawAudioToWavFile
 import com.lenovo.quantum.test.util.getFileSystemCacheDir
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
@@ -51,6 +52,7 @@ import java.io.File
 import java.io.FileWriter
 import java.net.URI
 import java.time.LocalDateTime
+import kotlin.toString
 
 // Document/PkbTool command actions:
 const val ADD_ACTION = "add"
@@ -62,6 +64,8 @@ const val STATISTIC_ACTION = "statistic"
 const val RE_PARSE_ACTION = "reparse"
 const val COLLECT_ALL_ACTION = "collect_all"
 const val SYNC_ACTION = "sync"
+
+const val FUZZY_SEARCH_ACTION = "fuzzy_search"
 const val ADD_AND_PARSE_ACTION = "add_and_parse"
 
 const val KBQA_ACTION = "kbqa"
@@ -96,14 +100,72 @@ data class FkbMemoryRequest(
     val shortContent: String? = null,
     val userText: String? = null,
     val bucket: String? = null,
+    val contentUri: String? = null,
     val url: String? = null,
-    val date: String? = null,
+    val syncId: String? = null,
+    val createdTime: String? = null,
+    val updateTime: String? = null,
     val language: String? = null,
     val saveReason: String? = null,
     val entries: List<Long>? = null,
     val query: String? = null,
     val topK: Int? = null,
-    val fields: List<String>? = null
+    val threshold: Float? = null,
+    val fields: List<String>? = null,
+    val tags: List<String>? = null,
+    val fuzzySearchText: String? = null,
+    val pageNumber: Int? = null,
+    val pageSize: Int? = null,
+    val userTags: List<String>? = null,
+    val userTagsColors: List<String>? = null
+)
+
+@Serializable
+data class PreferencesData(
+    val personalizedContentEnabled: Boolean? = null,
+    val synchronizationEnabled: Boolean? = null
+)
+
+@Serializable
+data class PreferencesRequest(
+    val action: String,
+    val prefs: PreferencesData? = null
+)
+
+
+@Serializable
+data class PreferencesResponse(
+    val action: String,
+    val prefs: PreferencesData? = null,
+    val result: Boolean? = null,
+    val message: String? = null
+)
+
+@Serializable
+data class BlobSyncRequest(
+    val action: String,
+    val blobType: String,
+    val data: String? = null,
+    val blobId: String? = null,
+    val deleteList: String? = null,
+    val pageSize: String = "10",
+    val pageNumber: String = "0",
+    val afterDate: String? = null,
+    val state: String? = null,
+    val sortBy: String? = null,
+)
+
+@Serializable
+private data class CloudTTSStreamable(
+    val femaleVoices: List<String>,
+    val maleVoices: List<String>
+)
+@Serializable
+private data class CloudTTSVoices(
+    val language: String,
+    val femaleVoices: List<String>,
+    val maleVoices: List<String>,
+    val streamable: CloudTTSStreamable
 )
 
 @Serializable
@@ -134,6 +196,8 @@ class ResettableSignal {
         channel = Channel<Unit>(Channel.UNLIMITED)
     }
 }
+
+
 
 class ChatbotViewModel(
     private val filePicker : FilePicker,
@@ -169,9 +233,31 @@ class ChatbotViewModel(
     val modelVersions = mutableStateListOf<String>()
     var selectedModelVersion by mutableStateOf("")
 
+    val multimodalInputTypes = mutableStateListOf<String>()
+
+    var selectedPromptInputType by mutableStateOf(PromptInputTypes.TEXT.toString())
+
+    // Brain intent / tool mode: null = all tools, "live" = FKB-only tools
+    var selectedBrainIntent by mutableStateOf<String?>(null)
+
+    var selectedCapabilitiesLevel by mutableStateOf("full")
+
+    val quotaFeatures = listOf("qira-credits", "image-generate")
+
+    var selectedQuotaFeature by mutableStateOf("qira-credits")
+
+    var mRecorderDuration : Float = 0.5F
     var isDocumentScreen by mutableStateOf(false)
 
 //    val docLists = mutableListOf<Document>()
+
+    //FKB Bucket list
+    val bucketList = mutableListOf("", "SUMMARY", "PERCEPTION")
+    var selectedBucket by mutableStateOf("")
+
+    fun setBucket(bucket: String) {
+        selectedBucket = bucket
+    }
 
     init {
         setupConnection()
@@ -203,6 +289,8 @@ class ChatbotViewModel(
         val parameter: String?
     )
     private var jobIdToCommand = mutableMapOf<Long, Command>()
+
+    val callbacks = mutableMapOf<Long, (OutputData) -> Unit>()
 
     data class CDNCapability(
         val component: String,
@@ -249,19 +337,9 @@ class ChatbotViewModel(
 
     fun sendQuery(query: String, imageSearchEnabled: Boolean? = null, imageSearchCount: Int? = null,
                   inputAudioStream: AudioStream? = null) {
-        logI(tag = TAG) { "sendQuery::E - $query; command=$selectedCommand - data: ${inputAudioStream?.data?.size}; - action = $selectedAction" }
+        logI(tag = TAG) { "sendQuery::E - $query; command=$selectedCommand - data: ${inputAudioStream?.data?.size}" }
         // send message
         viewModelScope.launch {
-
-            @Serializable
-            data class QueryRequest(
-                val handler : String,
-                val modelName : String,
-                val modelVersion : String,
-                val query: String,
-                val imageSearchEnabled: Boolean? = null,
-                val imageSearchCount: Int? = null
-            )
 
             @Serializable
             data class CDNCapabilitiesRequest(
@@ -281,6 +359,7 @@ class ChatbotViewModel(
                 else -> null
             }
             val uri = chosenFile?.uri
+            chosenFile = null  // reset UI UserInput as its state depends on this variable
             currentJobID = when (selectedCommand) {
                 "query" -> {
                     qtClient.sendCommand(
@@ -289,14 +368,12 @@ class ChatbotViewModel(
                             sessionId = sessionId ?: "",
                             data = DataContainer(
                                 text = Json.encodeToString(
-                                    QueryRequest(
+                                    PromptInput(
                                         handler = selectedHandler,
-                                        modelName = "gemini", //selectedModel,
-                                        modelVersion = "2.5-flash",
                                         query = query,
-                                        //imageSearchEnabled = imageSearchEnabled, // API-level control
-                                        //imageSearchCount = imageSearchCount
-
+                                        type = selectedPromptInputType,
+                                        brainIntent = selectedBrainIntent,
+                                        location = getLocation()
                                     )
                                 ),
                                 uri = uri?.let { listOf(it) },
@@ -305,19 +382,21 @@ class ChatbotViewModel(
                         )
                     )
                 }
-                "retrieval" -> {
+                "capabilities" -> {
+                    val capabilitiesText = when (selectedCapabilitiesLevel) {
+                        "quota" -> """{"level": "quota", "feature": "$selectedQuotaFeature"}"""
+                        "model" -> """{"level": "model", "model": "$selectedModel"}"""
+                        else -> null
+                    }
                     qtClient.sendCommand(
                         InputData(
-                            command = "retrieval",
+                            "capabilities",
                             sessionId = sessionId ?: "",
-                            data = DataContainer(
-                                text = JSONObject().put("query", query).toString()
-                            )
+                            data = DataContainer(text = capabilitiesText)
                         )
-                    )
-                }
-                "capabilities" -> {
-                    sendCapabilitiesWithRetry()
+                    )?.also { jobId ->
+                        jobIdToCommand[jobId] = Command("capabilities", null, selectedCapabilitiesLevel)
+                    }
                 }
                 "cdn" -> {
                     qtClient.sendCommand(
@@ -345,8 +424,44 @@ class ChatbotViewModel(
                         )
                     )
                 }
+                "tools" -> {
+                    qtClient.sendCommand(
+                        InputData(
+                            command = "tools",
+                            sessionId = sessionId ?: "",
+                            data = DataContainer(
+                                text = query
+                            )
+                        )
+                    )
+                }
+                "connectors" -> {
+                    qtClient.sendCommand(
+                        InputData(
+                            command = "connectors",
+                            data = DataContainer(
+                                text = query
+                            )
+                        )
+                    )
+                }
                 "model_call", "text_det", "layout" -> {
                     val inputJSONObj = when (selectedModel) {
+                        "cloudtts" -> {
+                            val locale = "en-US"
+                            val voice = if(selectedMSTTSVoice.lowercase().contains("ava")) {
+                                "voice15"
+                            } else "voice16"
+                            JsonObject(
+                                mapOf(
+                                    "modelName" to JsonPrimitive(selectedModel),
+                                    "modelVersion" to JsonPrimitive(selectedModelVersion),
+                                    "prompt" to JsonPrimitive(query),
+                                    "locale" to JsonPrimitive(locale),
+                                    "voiceName" to JsonPrimitive(voice)
+                                )
+                            )
+                        }
                         "mstts" -> {
                             JsonObject(
                                 mapOf(
@@ -358,7 +473,7 @@ class ChatbotViewModel(
                                 )
                             )
                         }
-                        "faiss", "lucenememory" -> {
+                        "lucenememory" -> {
                             JsonObject(
                                 mapOf(
                                     "modelName" to JsonPrimitive(selectedModel),
@@ -368,54 +483,293 @@ class ChatbotViewModel(
                                 )
                             )
                         }
-                        "msstt" -> {
-                            if (inputAudioStream?.eos == true) {
-                                val inputData = InputData(
-                                    command = "session",
-                                    data = DataContainer(
-                                        text = Json.encodeToString(
-                                            mapOf(
-                                                "action" to "finalize",
-                                                "sessionID" to sessionId.toString()
-                                            )
-                                        )
-                                    )
+                        "cloudstt" -> {
+                            JsonObject(
+                                mapOf(
+                                    "modelName" to JsonPrimitive(selectedModel),
+                                    "modelVersion" to JsonPrimitive(selectedModelVersion),
+                                    "language" to JsonPrimitive(selectedMSLanguage),
+                                    "eos" to JsonPrimitive(inputAudioStream?.eos)
                                 )
-                                sttSignal.reset()
-                                val jobId = qtClient.sendCommand(inputData)
-                                logD { "eos set for finalize with jobId $jobId, and data: $inputData"}
-                                jobIdToCommand[jobId] = Command("session", null, null)
-                                sttSignal.await()
-                                logD { "eos set for finalize finished waiting"}
-                            }
-
+                            )
+                        }
+                        "msstt" -> {
                             JsonObject(
                                 mapOf(
                                     "modelName" to JsonPrimitive(selectedModel),
                                     "modelVersion" to JsonPrimitive(selectedModelVersion),
                                     "prompt" to JsonPrimitive(""),
-                                    "locale" to JsonPrimitive(selectedMSLanguage)
+                                    "locale" to JsonPrimitive(selectedMSLanguage),
+                                    "chunkSize" to JsonPrimitive((mRecorderDuration*1000).toInt()),
+                                    "eos" to JsonPrimitive(inputAudioStream?.eos)
                                 )
                             )
                         }
+                        "azuretranslator" -> {
+                            val translationParams = try {
+                                Json.decodeFromString<JsonObject>(query)
+                            } catch (e: Exception) {
+                                JsonObject(
+                                    mapOf(
+                                        "text" to JsonPrimitive(query),
+                                        "to" to JsonPrimitive("en")
+                                    )
+                                )
+                            }
+
+                            val params = mutableMapOf(
+                                "modelName" to JsonPrimitive(selectedModel),
+                                "modelVersion" to JsonPrimitive(selectedModelVersion),
+                                "text" to JsonPrimitive(translationParams["text"]?.jsonPrimitive?.content ?: query),
+                                "to" to JsonPrimitive(translationParams["to"]?.jsonPrimitive?.content ?: "en")
+                            )
+
+                            translationParams["from"]?.jsonPrimitive?.content?.let { from ->
+                                params["from"] = JsonPrimitive(from)
+                            }
+
+                            JsonObject(params)
+                        }
+                        "azurecloudsafety", "localcontentsafety" -> {
+                            // Parse query as JSON if provided, otherwise treat as plain text
+                            val safetyParams = try {
+                                Json.decodeFromString<JsonObject>(query)
+                            } catch (e: Exception) {
+                                // Default: treat query as text content to analyze
+                                JsonObject(mapOf("text" to JsonPrimitive(query)))
+                            }
+
+                            val params = mutableMapOf<String, JsonElement>(
+                                "modelName" to JsonPrimitive(selectedModel),
+                                "modelVersion" to JsonPrimitive(selectedModelVersion)
+                            )
+
+                            // Common: text input
+                            safetyParams["text"]?.let { params["text"] = it }
+
+                            // Cloud-only parameters (skip for local)
+                            if (selectedModel == "azurecloudsafety") {
+                                // Image input: prefer DataContainer.uri/binary (handled in sendCommand)
+                                // Fallback: support base64 image from JSON param for backward compatibility
+                                if (uri == null || blob?.mime?.startsWith("image/") != true) {
+                                    safetyParams["image"]?.let { params["image"] = it }
+                                }
+                                safetyParams["categories"]?.let { params["categories"] = it }
+                                safetyParams["blocklistNames"]?.let { params["blocklistNames"] = it }
+                                safetyParams["haltOnBlocklistHit"]?.let { params["haltOnBlocklistHit"] = it }
+                                safetyParams["outputType"]?.let { params["outputType"] = it }
+                            }
+
+                            // Local-only parameters
+                            if (selectedModel == "localcontentsafety") {
+                                safetyParams["threshold"]?.let { params["threshold"] = it }
+                            }
+
+                            JsonObject(params)
+                        }
+                        "perplexity" -> {
+                            // Parse query as JSON if provided, otherwise default to search
+                            val perplexityParams = try {
+                                Json.decodeFromString<JsonObject>(query)
+                            } catch (e: Exception) {
+                                // Default: treat query as a search query
+                                JsonObject(
+                                    mapOf(
+                                        "action" to JsonPrimitive("search"),
+                                        "query" to JsonArray(listOf(JsonPrimitive(query)))
+                                    )
+                                )
+                            }
+
+                            val params = mutableMapOf<String, JsonElement>(
+                                "modelName" to JsonPrimitive(selectedModel)
+                            )
+
+                            // Copy action (default to "chatCompletion" if not specified in JSON)
+                            val action = perplexityParams["action"]?.jsonPrimitive?.content
+                                ?: "chatCompletion"
+                            params["action"] = JsonPrimitive(action)
+
+                            when (action) {
+                                "search" -> {
+                                    // Required parameter
+                                    perplexityParams["query"]?.let { params["query"] = it }
+
+                                    // Optional search parameters
+                                    perplexityParams["country"]?.let { params["country"] = it }
+                                    perplexityParams["last_updated_after_filter"]?.let { params["last_updated_after_filter"] = it }
+                                    perplexityParams["last_updated_before_filter"]?.let { params["last_updated_before_filter"] = it }
+                                    perplexityParams["max_results"]?.let { params["max_results"] = it }
+                                    perplexityParams["max_tokens"]?.let { params["max_tokens"] = it }
+                                    perplexityParams["search_after_date_filter"]?.let { params["search_after_date_filter"] = it }
+                                    perplexityParams["search_before_date_filter"]?.let { params["search_before_date_filter"] = it }
+                                    perplexityParams["search_domains_filter"]?.let { params["search_domains_filter"] = it }
+                                    perplexityParams["search_language_filter"]?.let { params["search_language_filter"] = it }
+                                    perplexityParams["search_mode"]?.let { params["search_mode"] = it }
+                                    perplexityParams["search_recency_filter"]?.let { params["search_recency_filter"] = it }
+                                }
+                                "chatCompletion", "chatCompletionStream" -> {
+                                    // Required parameters
+                                    perplexityParams["messages"]?.let { params["messages"] = it }
+
+                                    // Optional chat parameters
+                                    perplexityParams["model"]?.let { params["model"] = it }
+
+                                    // Web search options
+                                    perplexityParams["web_search_options"]?.let { params["web_search_options"] = it }
+
+                                    // Response format
+                                    perplexityParams["response_format"]?.let { params["response_format"] = it }
+
+                                    // Reasoning effort
+                                    perplexityParams["reasoning_effort"]?.let { params["reasoning_effort"] = it }
+
+                                    // Location parameters
+                                    perplexityParams["latitude"]?.let { params["latitude"] = it }
+                                    perplexityParams["longitude"]?.let { params["longitude"] = it }
+
+                                    // Return images and related questions for BOTH chatCompletion AND chatCompletionStream
+                                    perplexityParams["return_images"]?.let { params["return_images"] = it }
+                                    perplexityParams["return_related_questions"]?.let { params["return_related_questions"] = it }
+
+                                    //Image filtering parameters
+                                    perplexityParams["image_domain_filter"]?.let { params["image_domain_filter"] = it }
+                                    perplexityParams["image_size_filter"]?.let { params["image_size_filter"] = it }
+                                }
+                                "agentSearch" -> {
+                                    // Required parameter
+                                    val input = perplexityParams["input"] ?: JsonPrimitive(query)
+                                    params["input"] = input
+
+                                    // Forward preset if provided
+                                    perplexityParams["preset"]?.let { params["preset"] = it }
+
+                                    // Only set model if explicitly provided, or fall back to default in manual mode (no preset)
+                                    if (perplexityParams["model"] != null) {
+                                        params["model"] = perplexityParams["model"]!!
+                                    } else if (perplexityParams["preset"] == null) {
+                                        // Manual mode with no explicit model — use default
+                                        params["model"] = JsonPrimitive("perplexity/sonar")
+                                    }
+                                    // If preset is provided and model is not, model is correctly omitted
+                                    // Optional agent parameters
+                                    perplexityParams["instructions"]?.let { params["instructions"] = it }
+                                    perplexityParams["max_output_tokens"]?.let { params["max_output_tokens"] = it }
+                                    perplexityParams["max_tool_calls"]?.let { params["max_tool_calls"] = it }
+                                    perplexityParams["tools"]?.let { params["tools"] = it }
+                                }
+                            }
+
+                            JsonObject(params)
+                        }
+                        "connected-devices" -> {
+                            JsonObject(
+                                mapOf(
+                                    "prompt" to JsonPrimitive(query),
+                                    "modelName" to JsonPrimitive(selectedModel),
+                                    "modelVersion" to JsonPrimitive(selectedModelVersion),
+                                )
+                            )
+                        }
+                        "notifications" -> {
+                            val notifParams = try {
+                                Json.decodeFromString<JsonObject>(query)
+                            } catch (e: Exception) {
+                                JsonObject(
+                                    mapOf(
+                                        "action" to JsonPrimitive("get")
+                                    )
+                                )
+                            }
+
+                            val params = mutableMapOf<String, JsonElement>(
+                                "modelName" to JsonPrimitive(selectedModel),
+                                "modelVersion" to JsonPrimitive(selectedModelVersion)
+                            )
+
+                            notifParams["action"]?.let { params["action"] = it }
+
+                            // Forward all other fields as-is for send action
+                            notifParams.forEach { (key, value) ->
+                                if (key != "action") params[key] = value
+                            }
+
+                            JsonObject(params)
+                        }
+                        "azuremaps" -> {
+                            // Parse query as JSON if provided, otherwise default to geocodeAddress
+                            val mapsParams = try {
+                                Json.decodeFromString<JsonObject>(query)
+                            } catch (e: Exception) {
+                                // Default: treat query as address for geocodeAddress
+                                JsonObject(
+                                    mapOf(
+                                        "action" to JsonPrimitive("geocodeAddress"),
+                                        "address" to JsonPrimitive(query)
+                                    )
+                                )
+                            }
+
+                            val params = mutableMapOf<String, JsonElement>(
+                                "modelName" to JsonPrimitive(selectedModel),
+                                "modelVersion" to JsonPrimitive(selectedModelVersion)
+                            )
+
+                            // Copy action and relevant parameters
+                            mapsParams["action"]?.let { params["action"] = it }
+                            mapsParams["address"]?.let { params["address"] = it }
+                            mapsParams["latitude"]?.let { params["latitude"] = it }
+                            mapsParams["longitude"]?.let { params["longitude"] = it }
+
+                            JsonObject(params)
+                        }
                         else -> {
+                            // Use OpenAI-compatible format
                             JsonObject(
                                 mapOf(
                                     "modelName" to JsonPrimitive(selectedModel),
-                                    "modelVersion" to JsonPrimitive(selectedModelVersion),
-                                    "prompt" to JsonPrimitive(query)
+                                    "model" to JsonPrimitive(selectedModelVersion),
+                                    "messages" to JsonArray(
+                                        listOf(
+                                            JsonObject(
+                                                mapOf(
+                                                    "role" to JsonPrimitive("user"),
+                                                    "content" to JsonPrimitive(query)
+                                                )
+                                            )
+                                        )
+                                    ),
+                                    "max_tokens" to JsonPrimitive(1000),
+                                    "temperature" to JsonPrimitive(1.0),
+                                    "stream" to JsonPrimitive(true),
                                 )
                             )
                         }
                     }
+                    // Include uri for models that support DataContainer.uri (e.g., azurecloudsafety)
+                    val includeUri = uri != null
+                    logD(tag = TAG) { "model_call: blob=${blob?.mime}, uri=$uri, includeUri=$includeUri" }
+
+                    // models that want to test modifications on top of the OpenAI format
+                    val modifiedJSON =
+                        if (selectedModel == "gemini" &&
+                            selectedModelVersion == "2.5-flash-image") {
+                            JsonObject(inputJSONObj.toMutableMap().apply {
+                                this["aspectRatio"] = JsonPrimitive("16:9")
+                            })
+                        } else {
+                            inputJSONObj
+                        }
+
                     qtClient.sendCommand(
                         InputData(
                             command = selectedCommand,
                             sessionId = sessionId ?: "",
                             data = DataContainer(
                                 text = Json.encodeToString(
-                                    inputJSONObj
+                                    modifiedJSON
                                 ),
+                                uri = if (includeUri) listOf(uri!!) else null,
                                 binary = blob?.let { listOf(blob) }
                             )
                         )
@@ -429,33 +783,39 @@ class ChatbotViewModel(
                                 action = "add_memory",
                                 model = selectedModel,
                                 userText = query,
-                                date = LocalDateTime.now().toString()
+                                bucket = selectedBucket
                             )
                         )
                         "restore_memory" -> {
                             val jsonObject = JSONObject(query)
                             logD { "Retrieved json = $jsonObject" }
-                            val contentFromJson = jsonObject.optString("content")
-                            val shortContentFromJson = jsonObject.optString("shortContent")
-                            val userTextFromJson = jsonObject.optString("userText")
-                            val bucketFromJson = jsonObject.optString("shortContent")
-                            val saveReasonFromJson = jsonObject.optString("saveReason")
-                            val urlFromJson = jsonObject.optString("url")
-                            val dateFromJson = jsonObject.optString("date")
-                            val languageFromJson = jsonObject.optString("language")
 
+                            val superIdFromJson = jsonObject.optString("superId")
+                            val contentFromJson = jsonObject.optString("content")
+                            val shortContentFromJson= jsonObject.optString("shortContent")
+                            val bucketFromJson= jsonObject.optString("bucket")
+                            val contentUriFromJson= jsonObject.optString("contentUri")
+                            val urlFromJson= jsonObject.optString("url")
+                            val syncIdFromJson= jsonObject.optString("syncId")
+                            val createdTimeFromJson= jsonObject.optString("createdTime")
+                            val updateTimeFromJson= jsonObject.optString("updateTime")
+                            val languageFromJson= jsonObject.optString("language")
+                            val saveReasonFromJson= jsonObject.optString("saveReason")
                             Json.encodeToString(
                                 FkbMemoryRequest(
                                     action = "restore_memory",
                                     model = selectedModel,
+                                    superId = superIdFromJson,
                                     content = contentFromJson,
                                     shortContent = shortContentFromJson,
-                                    userText = userTextFromJson,
                                     bucket = bucketFromJson,
-                                    saveReason = saveReasonFromJson,
+                                    contentUri = contentUriFromJson,
                                     url = urlFromJson,
-                                    date = dateFromJson,
-                                    language = languageFromJson
+                                    syncId = syncIdFromJson,
+                                    createdTime = createdTimeFromJson,
+                                    updateTime = updateTimeFromJson,
+                                    language = languageFromJson,
+                                    saveReason = saveReasonFromJson
                                 )
                             )
                         }
@@ -463,6 +823,7 @@ class ChatbotViewModel(
                             val jsonObject = JSONObject(query)
                             logD { "Retrieved json = $jsonObject" }
                             val queryFromJson = jsonObject.optString("query")
+                            val fuzzySearchFromJson = jsonObject.optString("fuzzy_search")
                             val topKFromJson = jsonObject.optInt("topK")
                             val topK = if (topKFromJson == 0) null else topKFromJson
                             if (queryFromJson.isNotEmpty()) {
@@ -473,6 +834,18 @@ class ChatbotViewModel(
                                         model = selectedModel,
                                         query = queryFromJson,
                                         topK = topK
+                                    )
+                                )
+                            } else if (fuzzySearchFromJson.isNotEmpty()) {
+                                var bucketFromJson = jsonObject.optString("bucket")
+                                if (bucketFromJson.isEmpty()) bucketFromJson = "SUMMARY"
+                                logD { "get_memory: fuzzy_search=$fuzzySearchFromJson, bucket=$bucketFromJson" }
+                                Json.encodeToString(
+                                    FkbMemoryRequest(
+                                        action = "get_memory",
+                                        model = selectedModel,
+                                        fuzzySearchText = fuzzySearchFromJson,
+                                        bucket = bucketFromJson
                                     )
                                 )
                             } else {
@@ -496,11 +869,25 @@ class ChatbotViewModel(
                             }
                         }
                         "get_all_memory" -> {
+                            var pageNumber: Int? = null
+                            var pageSize: Int? = null
+                            try {
+                                val jsonObject = JSONObject(query)
+                                logD { "Retrieved json = $jsonObject" }
+                                pageNumber = jsonObject.getInt("page_number")
+                                pageSize = jsonObject.getInt("page_size")
+
+                            } catch (e: Exception) {
+                                logE { "Failed to parse input json, assuming default values" }
+                            }
+                            logD { "get_all_memory: page = $pageNumber; size = $pageSize" }
                             Json.encodeToString(
                                 FkbMemoryRequest(
                                     action = "get_all_memory",
                                     model = selectedModel,
-                                    fields = listOf("id", "content", "bucket")
+                                    pageNumber = pageNumber,
+                                    pageSize = pageSize,
+                                    bucket = selectedBucket
                                 )
                             )
                         }
@@ -533,6 +920,104 @@ class ChatbotViewModel(
                                 )
                             )
                         }
+                        "user_tags_update" -> {
+                            val jsonObject = JSONObject(query)
+                            val entriesJsonArr = jsonObject.optJSONArray("entries")
+                            val userTagsJsonArr = jsonObject.optJSONArray("user_tags")
+                            val entries = mutableListOf<Long>()
+                            val userTags = mutableListOf<String>()
+                            if (entriesJsonArr != null) {
+                                for (i in 0 until entriesJsonArr.length()) {
+                                    val id = entriesJsonArr[i].toString().toLong()
+                                    entries.add(id)
+                                }
+                            }
+                            if (userTagsJsonArr != null) {
+                                for (i in 0 until userTagsJsonArr.length()) {
+                                    val tag = userTagsJsonArr[i].toString()
+                                    userTags.add(tag)
+                                }
+                            }
+                            Json.encodeToString(
+                                FkbMemoryRequest(
+                                    action = "user_tags_update",
+                                    model = selectedModel,
+                                    entries = entries,
+                                    userTags = userTags
+                                )
+                            )
+                        }
+                        "user_tags_get" -> {
+                            val jsonObject = JSONObject(query)
+                            val userTagsJsonArr = jsonObject.optJSONArray("user_tags")
+                            val userTags = mutableListOf<String>()
+                            if (userTagsJsonArr != null) {
+                                for (i in 0 until userTagsJsonArr.length()) {
+                                    val tag = userTagsJsonArr[i].toString()
+                                    userTags.add(tag)
+                                }
+                            }
+                            Json.encodeToString(
+                                FkbMemoryRequest(
+                                    action = "user_tags_get",
+                                    model = selectedModel,
+                                    userTags = userTags
+                                )
+                            )
+                        }
+                        "user_tags_create" -> {
+                            val jsonObject = JSONObject(query)
+                            val userTagsJsonArr = jsonObject.optJSONArray("user_tags")
+                            val colorsJsonArr = jsonObject.optJSONArray("colors")
+                            val userTags = mutableListOf<String>()
+                            val colors = mutableListOf<String>()
+                            if (userTagsJsonArr != null) {
+                                for (i in 0 until userTagsJsonArr.length()) {
+                                    val tag = userTagsJsonArr[i].toString()
+                                    userTags.add(tag)
+                                }
+                            }
+                            if (colorsJsonArr != null) {
+                                for (i in 0 until colorsJsonArr.length()) {
+                                    val color = colorsJsonArr[i].toString()
+                                    colors.add(color)
+                                }
+                            }
+                            Json.encodeToString(
+                                FkbMemoryRequest(
+                                    action = "user_tags_create",
+                                    model = selectedModel,
+                                    userTags = userTags,
+                                    userTagsColors = colors
+                                )
+                            )
+                        }
+                        "user_tags_delete" -> {
+                            val jsonObject = JSONObject(query)
+                            val userTagsJsonArr = jsonObject.optJSONArray("user_tags")
+                            val userTags = mutableListOf<String>()
+                            if (userTagsJsonArr != null) {
+                                for (i in 0 until userTagsJsonArr.length()) {
+                                    val tag = userTagsJsonArr[i].toString()
+                                    userTags.add(tag)
+                                }
+                            }
+                            Json.encodeToString(
+                                FkbMemoryRequest(
+                                    action = "user_tags_delete",
+                                    model = selectedModel,
+                                    userTags = userTags
+                                )
+                            )
+                        }
+                        "user_tags_get_available" -> {
+                            Json.encodeToString(
+                                FkbMemoryRequest(
+                                    action = "user_tags_get_available",
+                                    model = selectedModel
+                                )
+                            )
+                        }
                         else -> {
                             logE { "Invalid command/action received: $selectedCommand / $selectedAction" }
                         }
@@ -545,6 +1030,45 @@ class ChatbotViewModel(
                             data = DataContainer(
                                 text = fkbJson.toString(),
                                 binary = blob?.let { listOf(blob) }
+                            )
+                        )
+                    )
+                }
+                "qt_prefs" -> {
+                    logD { "selected action: $selectedAction" }
+                    val prefsData = when (selectedAction) {
+                        "get_qt_prefs" -> Json.encodeToString(
+                            PreferencesRequest(
+                                action = selectedAction
+                            )
+                        )
+
+                        "set_qt_prefs" -> {
+                            val params = query.split(";")
+                            val pFlag = params[0].toBoolean()
+                            val sFlag = params[1].toBoolean()
+                            Json.encodeToString(
+                                PreferencesRequest(
+                                    action = selectedAction,
+                                    prefs = PreferencesData(
+                                        personalizedContentEnabled = pFlag,
+                                        synchronizationEnabled = sFlag
+                                    )
+                                )
+                            )
+                        }
+                        else -> {
+                            logE { "Invalid command/action received: $selectedCommand / $selectedAction" }
+                            ""
+                        }
+                    }
+                    logD { "Setting prefs: $prefsData" }
+                    qtClient.sendCommand(
+                        InputData(
+                            command = selectedCommand,
+                            sessionId = sessionId ?: "",
+                            data = DataContainer(
+                                text = prefsData
                             )
                         )
                     )
@@ -567,38 +1091,18 @@ class ChatbotViewModel(
                             body.put("doc_paths", docPaths)
                         }
                         LIST_ACTION -> {
-                            body.put("folder_path", query)
+                            if (query != "ALL") {
+                                body.put("folder_path", query)
+                            } else {
+                                body.put("folder_path", "")
+                            }
                         }
                         DELETE_ACTION -> {
                             val docIds = JSONObject(query).getJSONArray("doc_ids")
                             body.put("doc_ids", docIds)
                         }
-                        PARSE_ACTION -> {
-                            val docIds = JSONObject(query).getJSONArray("doc_ids")
-                            body.put("doc_ids", docIds)
-                        }
-                        COLLECT_ACTION -> {
-                            val jsonInput = JSONObject(query)
-                            val docId = jsonInput.getLong("doc_id")
-                            val flag = jsonInput.getBoolean("flag")
-                            body.put("doc_id", docId)
-                            body.put("flag", flag)
-                        }
-                        RE_PARSE_ACTION -> {
-                            // do nothing, just send the re_parse action
-                        }
-                        COLLECT_ALL_ACTION -> {
-                            // do nothing, just send the collect_all action
-                        }
-                        SYNC_ACTION -> {
-
-                        }
-                        ADD_AND_PARSE_ACTION -> {
-                            val docPaths = JSONArray()
-                            logD { "add_and_parse, uri = $uri" }
-                            docPaths.put(uri)
-                            body.put("doc_paths", docPaths)
-                            logD { "add_and_parse, docPaths = $docPaths" }
+                        FUZZY_SEARCH_ACTION -> {
+                            body.put("substring", query)
                         }
                     }
                     if (body.length() > 0) {
@@ -668,19 +1172,25 @@ class ChatbotViewModel(
                     val action = jsonObject.optString("action").toString()
                     val blobData = jsonObject.optString("data").toString().ifBlank { null }
                     val blobId = jsonObject.optString("blobId").toString().ifBlank { null }
-                    val blobType = jsonObject.optString("blobType").toString().ifBlank { null }
-                    val metaData = jsonObject.optString("metaData").toString().ifBlank { null }
-                    val kid = jsonObject.optString("kid").toString().ifBlank { null }
-                    val date = jsonObject.optString("date").toString().ifBlank { null }
+                    val blobType = jsonObject.optString("blobType").toString()
+                    val sortBy = jsonObject.optString("sortBy").toString().ifBlank { null }
+                    val deleteList = jsonObject.optString("deleteList").toString().ifBlank { null }
+                    val afterDate = jsonObject.optString("afterDate").toString().ifBlank { null }
+                    val state = jsonObject.optString("state").toString().ifBlank { null }
+                    val pageSize = jsonObject.optString("pageSize").toString().ifBlank { null }
+                    val pageNumber = jsonObject.optString("pageNumber").toString().ifBlank { null }
 
-                    val blobJson = Json.encodeToString(BlobsyncRequestResponse(
+                    val blobJson = Json.encodeToString(BlobSyncRequest(
                         action.ifEmpty { selectedCommand },
+                        blobType,
                         blobData,
                         blobId,
-                        blobType,
-                        metaData,
-                        kid,
-                        if(date.isNullOrEmpty()) Clock.System.now().toString() else date
+                        deleteList,
+                        pageSize ?: "10",
+                        pageNumber ?: "0",
+                        afterDate,
+                        state,
+                        sortBy
                     ))
                     logD { "Sending command: $blobJson" }
                     qtClient.sendCommand(
@@ -693,7 +1203,37 @@ class ChatbotViewModel(
                         )
                     )
                 }
+                "session" -> {
+                    logD { "session - selected action: $selectedAction" }
+                    val jsonObject = JSONObject()
+                    jsonObject.put("action", selectedAction)
+                    when (selectedAction) {
+                        "get" ->
+                            jsonObject.put("sessionID", query)
 
+                        "update" -> {
+                            jsonObject.put("sessionID", sessionId)
+                            jsonObject.put("sessionName", query)
+                        }
+
+                        "add_message" -> {
+                            jsonObject.put("sessionID", sessionId)
+                            jsonObject.put("role", "user")  // hardcoded for testing
+                            jsonObject.put("message", query)
+                        }
+                    }
+                    logD { "session data: $jsonObject" }
+                    qtClient.sendCommand(
+                        InputData(
+                            command = "session",
+                            sessionId = sessionId ?: "",
+                            data = DataContainer(
+                                text = jsonObject.toString(),
+                                binary = blob?.let { listOf(blob) }
+                            )
+                        )
+                    )
+                }
                 else -> {
                     qtClient.sendCommand(
                         InputData(
@@ -722,7 +1262,6 @@ class ChatbotViewModel(
                         action = selectedAction,
                         model = selectedModel,
                         userText = entry.optString("userText"),
-                        date = entry.optString("date")
                     )
                 }
                 "get_memory" -> {
@@ -903,6 +1442,46 @@ class ChatbotViewModel(
             )
             val jobId = qtClient.sendCommand(inputData)
             jobIdToCommand[jobId] = Command("session", null, null)
+        }
+    }
+
+    fun getLocation() : String? {
+        return getUtil().getLocation(
+            platformContext
+        ) { lat, long ->
+            val location = CompletableDeferred<String>()
+
+            sendCommand(
+                InputData(
+                    command = "model_call",
+                    data = DataContainer(
+                        Json.encodeToString(
+                            mapOf(
+                                "modelName" to "azuremaps",
+                                "action" to "reverseGeocode",
+                                "latitude" to lat.toString(),
+                                "longitude" to long.toString(),
+                            )
+                        )
+                    )
+                )
+            ) { outputData ->
+                if (outputData.status == UseCaseResponse.COMPLETE) {
+                    val resultJson = try {
+                        Json.decodeFromString<JsonObject>(outputData.data?.text ?: "{}")
+                    } catch (e: Exception) {
+                        location.complete("")
+                        return@sendCommand
+                    }
+
+                    val address = resultJson["address"]?.jsonPrimitive?.content ?: ""
+                    location.complete(address)
+                } else if (outputData.status == UseCaseResponse.FAILED) {
+                    location.complete("")
+                }
+            }
+
+            location.await()
         }
     }
 
@@ -1357,6 +1936,24 @@ class ChatbotViewModel(
     val queries = listOf("Did Kendra miss the bus?")
     var i = 0
     var startTime = System.currentTimeMillis()
+
+    private fun sendCommand(input : InputData, callback : (OutputData) -> Unit) {
+        viewModelScope.launch {
+            val jobId = qtClient.sendCommand(input)
+
+            if (jobId < 0) {
+                callback(
+                    OutputData(
+                        -1,
+                        UseCaseResponse.FAILED,
+                        DataContainer("Error connecting to core")
+                    )
+                )
+            } else {
+                callbacks[jobId] = callback
+            }
+        }
+    }
     override fun onResult(result: OutputData) {
         viewModelScope.launch {
             logD { "got result: $result" }
